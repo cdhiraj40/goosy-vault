@@ -22,12 +22,12 @@ const PROGRAM_INFO_SEED: &[u8] = b"program_info";
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
 
-    let base64_prv_key = env::var("ADMIN_PRVKEY").expect("ADMIN_PRVKEY must be set");
+    let base64_prv_key = env::var("FEEPAYER_PRVKEY").expect("FEEPAYER_PRVKEY must be set");
 
     // Decode the private key and create a Keypair
     let prv_key_bytes = decode(base64_prv_key)?;
-    let admin_keypair = Keypair::from_bytes(&prv_key_bytes)?;
-    println!("Public Key: {}", admin_keypair.pubkey());
+    let fee_payer_keypair = Keypair::from_bytes(&prv_key_bytes)?;
+    println!("Public Key: {}", fee_payer_keypair.pubkey());
 
     // Initialize RPC client
     let rpc_client = initialize_rpc_client();
@@ -38,7 +38,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Get the number of vaults and process them
     let vaults_count = fetch_vaults_count(&rpc_client, &program_info_pda).await?;
-    process_vaults(&rpc_client, vaults_count, &program_id, &program_info_pda, &admin_keypair).await?;
+    process_vaults(
+        &rpc_client,
+        vaults_count,
+        &program_id,
+        &program_info_pda,
+        &fee_payer_keypair,
+    )
+    .await?;
 
     Ok(())
 }
@@ -48,10 +55,14 @@ fn initialize_rpc_client() -> RpcClient {
     RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed())
 }
 
-async fn fetch_vaults_count(rpc_client: &RpcClient, program_info_pda: &Pubkey) -> Result<u32, Box<dyn Error>> {
+async fn fetch_vaults_count(
+    rpc_client: &RpcClient,
+    program_info_pda: &Pubkey,
+) -> Result<u32, Box<dyn Error>> {
     let program_info_data = rpc_client.get_account_data(program_info_pda).await?;
-    let vaults_count = goosy_vault::state::ProgramInfo::try_deserialize(&mut program_info_data.as_slice())?
-        .vaults_count;
+    let vaults_count =
+        goosy_vault::state::ProgramInfo::try_deserialize(&mut program_info_data.as_slice())?
+            .vaults_count;
     Ok(vaults_count)
 }
 
@@ -70,7 +81,14 @@ async fn process_vaults(
 
         println!("Vault index{}: {:?}", i, vault);
 
-        distribute_interest_to_vaults(rpc_client, vec![vault_pda], program_id, program_info_pda, payer).await?;
+        distribute_interest_to_vaults(
+            rpc_client,
+            vec![vault_pda],
+            program_id,
+            program_info_pda,
+            payer,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -87,7 +105,8 @@ pub fn compute_anchor_discriminator(namespace: &str, name: &str) -> [u8; 8] {
     let mut discriminator = [0u8; 8];
 
     discriminator.copy_from_slice(
-        &anchor_client::anchor_lang::solana_program::hash::hash(preimage.as_bytes()).to_bytes()[..8],
+        &anchor_client::anchor_lang::solana_program::hash::hash(preimage.as_bytes()).to_bytes()
+            [..8],
     );
 
     discriminator
@@ -107,9 +126,13 @@ async fn distribute_interest_to_vaults(
     let mint = Pubkey::from_str(&mint_key)?;
 
     let admin_vault_spl_token_account =
-        get_or_create_associated_token_account(rpc_client, payer, &mint, &payer.pubkey()).await?;
+        get_or_create_associated_token_account(rpc_client, payer, &mint, &admin_vault_pda).await?;
 
-    println!("Payer public key: {}", payer.pubkey());
+    println!(
+        "Payer public key: {}, admin vault PDA {}",
+        payer.pubkey(),
+        admin_vault_pda
+    );
 
     for vault_pda in vaults {
         println!("Vault PDA: {}", vault_pda);
@@ -125,7 +148,6 @@ async fn distribute_interest_to_vaults(
             &mint,
             program_info_pda,
             &id(),
-            payer,
         );
         let mut transaction =
             Transaction::new_with_payer(&[interest_instruction], Some(&payer.pubkey()));
@@ -144,9 +166,18 @@ async fn distribute_interest_to_vaults(
             .get_token_account_balance(&destination_vault_spl_associated_token_account)
             .await?;
 
-        println!("Admin vault balance: {:?}", admin_vault_spl_token_account_balance.ui_amount);
-        println!("Destination vault balance: {:?}", destination_vault_spl_token_account_balance.ui_amount);
-        println!("Destination vault: {:?}", destination_vault_spl_associated_token_account);
+        println!(
+            "Admin vault balance: {:?}",
+            admin_vault_spl_token_account_balance.ui_amount
+        );
+        println!(
+            "Destination vault balance: {:?}",
+            destination_vault_spl_token_account_balance.ui_amount
+        );
+        println!(
+            "Destination vault: {:?}",
+            destination_vault_spl_associated_token_account
+        );
     }
 
     Ok(())
@@ -161,15 +192,13 @@ fn create_distribute_interest_instruction(
     mint: &Pubkey,
     program_info_pda: &Pubkey,
     token_program: &Pubkey,
-    signer: &Keypair,
 ) -> Instruction {
-    let discriminator = compute_anchor_discriminator("global", "distribute_interest");     // [161, 80, 239, 247, 115, 254, 122, 80]
+    let discriminator = compute_anchor_discriminator("global", "distribute_interest"); // [161, 80, 239, 247, 115, 254, 122, 80]
 
     let data = Vec::from(discriminator);
 
     let accounts = vec![
         AccountMeta::new(*admin_vault_pda, false),
-        AccountMeta::new(signer.pubkey(), true),
         AccountMeta::new(*destination_vault_pda, false),
         AccountMeta::new(*admin_vault_spl_token_account, false),
         AccountMeta::new(*destination_vault_spl_token_account, false),
@@ -195,7 +224,10 @@ async fn get_or_create_associated_token_account(
 
     match rpc_client.get_account(&associated_token_address).await {
         Ok(_) => {
-            println!("Associated token account exists: {}", associated_token_address);
+            println!(
+                "Associated token account exists: {}",
+                associated_token_address
+            );
             Ok(associated_token_address)
         }
         Err(_) => {
@@ -203,10 +235,8 @@ async fn get_or_create_associated_token_account(
             let create_account_instruction =
                 instruction::create_associated_token_account(&payer.pubkey(), owner, mint, &id());
 
-            let mut transaction = Transaction::new_with_payer(
-                &[create_account_instruction],
-                Some(&payer.pubkey()),
-            );
+            let mut transaction =
+                Transaction::new_with_payer(&[create_account_instruction], Some(&payer.pubkey()));
             let recent_blockhash = rpc_client.get_latest_blockhash().await?;
             transaction.sign(&[payer], recent_blockhash);
             rpc_client

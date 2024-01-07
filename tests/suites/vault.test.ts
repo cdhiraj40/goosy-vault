@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { AnchorError, BN, Program } from "@coral-xyz/anchor";
+import { BN, Program } from "@coral-xyz/anchor";
 import { PublicKey, Keypair } from "@solana/web3.js";
 import { encode } from "@coral-xyz/anchor/dist/cjs/utils/bytes/utf8";
 import { assert, expect } from "chai";
@@ -8,8 +8,8 @@ import { GoosyVault } from "../../target/types/goosy_vault";
 import {
   Account,
   createMint,
+  getMint,
   getOrCreateAssociatedTokenAccount,
-  mintToChecked,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { Context } from "mocha";
@@ -29,9 +29,7 @@ export default function suite() {
     programInfoPDA: PublicKey;
 
   // Variables that will be used to deposit, withdraw funds
-  let testVaultPDA: PublicKey,
-    testVaultOwner: Keypair,
-    testVaultSplTokenAccount: Account;
+  let testVaultOwner: Keypair, testVaultSplTokenAccount: Account;
 
   const tokenDecimals = 6;
 
@@ -39,14 +37,16 @@ export default function suite() {
     ({ program, connection, admin, programInfoPDA, generateFundedKeypair } =
       setupContext(this.test.ctx));
 
+    adminVaultPDA = getAdminVaultPDA()[0];
     mint = await mintToken(admin, 6); // 6 decimal places for token i.e. 1 SPL token = 1000000 smallest units
-    ({
-      vaultPDA,
-      vaultOwner,
-      vaultSplTokenAccount,
-      adminSplTokenAccount,
-      adminVaultPDA,
-    } = await setupVault(true));
+
+    try {
+      ({ vaultPDA, vaultOwner, vaultSplTokenAccount, adminSplTokenAccount } =
+        await setupVault(true));
+    } catch (e) {
+      console.log("Error minting token: ");
+      console.log(e);
+    }
 
     await createAdminVault();
 
@@ -61,8 +61,7 @@ export default function suite() {
 
     ({ vaultPDA, vaultOwner, vaultSplTokenAccount } = await setupVault());
 
-    ({ testVaultPDA, testVaultOwner, testVaultSplTokenAccount } =
-      await setupTestVault());
+    ({ testVaultOwner, testVaultSplTokenAccount } = await setupTestVault());
   });
 
   it("Creates a Vault", async () => {
@@ -76,14 +75,16 @@ export default function suite() {
     const vaultsCount = (
       await program.account.programInfo.fetch(programInfoPDA)
     ).vaultsCount;
-    expect(vaultsCount).to.eql(2);
+    expect(vaultsCount).to.eql(
+      2,
+      "The number of vaults should be incremented to 2 after creating a new vault"
+    );
   });
 
-  it("author can deposit tokens to vault", async () => {
+  it("User can deposit tokens to vault", async () => {
     await createVault(vaultOwner);
 
     const amountToDeposit = new BN(100);
-
     await depositSPLTokens(
       testVaultSplTokenAccount.address,
       vaultSplTokenAccount.address,
@@ -92,21 +93,51 @@ export default function suite() {
     );
 
     const vault = await program.account.vault.fetch(vaultPDA);
-    expect(vault.totalBalance.toNumber()).to.eql(100);
+    expect(vault.totalBalance.toNumber()).to.eql(
+      100,
+      "Vault's total balance should be 100 after deposit"
+    );
 
     const vaultSplTokenAccountBalance = await connection.getTokenAccountBalance(
       vaultSplTokenAccount.address
     );
-
     console.log(
-      "Deposited to vault spl address: ",
-      vaultSplTokenAccount.address.toBase58()
+      `Vault SPL token account balance after deposit: ${vaultSplTokenAccountBalance.value.uiAmount}`
     );
-
-    expect(vaultSplTokenAccountBalance.value.amount).to.eql("100");
+    expect(vaultSplTokenAccountBalance.value.uiAmount).to.eql(
+      100 / 10 ** 6,
+      "On-chain token account balance should match the deposited amount"
+    );
   });
 
-  it("author can withdraw funds", async () => {
+  it("User can withdraw funds", async () => {
+    await createVault(vaultOwner);
+
+    const amount = new BN(100);
+
+    await depositSPLTokens(
+      testVaultSplTokenAccount.address,
+      vaultSplTokenAccount.address,
+      testVaultOwner,
+      amount
+    );
+
+    await withdrawSPLTokens(
+      testVaultSplTokenAccount.address,
+      vaultSplTokenAccount.address,
+      testVaultOwner,
+      vaultOwner,
+      amount
+    );
+
+    const vault = await program.account.vault.fetch(vaultPDA);
+    expect(vault.totalBalance.toNumber()).to.eql(
+      0,
+      "Vault's total balance should be 0 after withdrawal"
+    );
+  });
+
+  it("A user cannot withdraw someone else's funds", async () => {
     await createVault(vaultOwner);
 
     const amountToDeposit = new BN(100);
@@ -121,55 +152,7 @@ export default function suite() {
     let vault = await program.account.vault.fetch(vaultPDA);
     expect(vault.totalBalance.toNumber()).to.eql(100);
 
-    await fundAccount(
-      testVaultOwner,
-      admin,
-      testVaultSplTokenAccount.address,
-      mint,
-      1000 * 10 ** 6
-    ); // Fund user with 1000 tokens
-
-    await program.methods
-      .withdrawSplTokens(amountToDeposit)
-      .accounts({
-        vault: vaultPDA,
-        owner: vaultOwner.publicKey,
-        payer: testVaultOwner.publicKey,
-        userSplTokenAccount: testVaultSplTokenAccount.address,
-        vaultSplTokenAccount: vaultSplTokenAccount.address,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([testVaultOwner, vaultOwner])
-      .rpc();
-
-    vault = await program.account.vault.fetch(vaultPDA);
-    expect(vault.totalBalance.toNumber()).to.eql(0);
-  });
-
-  it("A user cannot withdraw someone else's funds", async () => {
     try {
-      await createVault(vaultOwner);
-
-      const amountToDeposit = new BN(100);
-
-      await depositSPLTokens(
-        testVaultSplTokenAccount.address,
-        vaultSplTokenAccount.address,
-        testVaultOwner,
-        amountToDeposit
-      );
-
-      let vault = await program.account.vault.fetch(vaultPDA);
-      expect(vault.totalBalance.toNumber()).to.eql(100);
-
-      await fundAccount(
-        testVaultOwner,
-        admin,
-        testVaultSplTokenAccount.address,
-        mint,
-        1000 * 10 ** 6
-      ); // Fund user with 1000 tokens
-
       await program.methods
         .withdrawSplTokens(amountToDeposit)
         .accounts({
@@ -180,16 +163,12 @@ export default function suite() {
           vaultSplTokenAccount: vaultSplTokenAccount.address,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .signers([testVaultOwner, testVaultOwner])
+        .signers([testVaultOwner])
         .rpc();
 
-      assert.fail("Should have thrown an error");
+      assert.fail("Withdrawal by non-owner should have failed");
     } catch (e: any) {
-      if (e instanceof AnchorError) {
-        console.log("AnchorError: " + e, "This is expected");
-      } else {
-        console.log("Error: " + e + "This is expected");
-      }
+      console.log(`Expected error due to non-owner withdrawal: ${e}`);
     }
   });
 
@@ -197,7 +176,6 @@ export default function suite() {
     await createVault(vaultOwner);
 
     const amountToDeposit = new BN(100);
-
     await depositSPLTokens(
       testVaultSplTokenAccount.address,
       vaultSplTokenAccount.address,
@@ -205,12 +183,40 @@ export default function suite() {
       amountToDeposit
     );
 
+    // Fetch the initial balance of the vault
+    const initialBalance = await connection.getTokenAccountBalance(
+      vaultSplTokenAccount.address
+    );
+
     try {
       await distributeInterest(vaultPDA, vaultSplTokenAccount.address);
-      assert.fail("Should have thrown an error");
+
+      // Uncomment to test distribution
+      // NOTE: Do comment the time bound code inside instruction `distribute_interest.rs`
+      // const expectedNewBalance = initialBalance.value.uiAmount + initialBalance.value.uiAmount * 0.01;
+      //
+      // // Fetch the balance after distributing interest
+      // const updatedVaultBalance =
+      //     await connection.getTokenAccountBalance(vaultSplTokenAccount.address);
+      //
+      // // Assert that the balance has not changed
+      // expect(updatedVaultBalance.value.uiAmount)
+      //     .to.equal(expectedNewBalance, "Vault balance should have increased by 1%");
+
+      assert.fail(
+        "Interest distribution should have failed due to time constraint"
+      );
     } catch (e) {
-      console.log("Error: " + e + "This is expected");
+      console.log(`Expected error due to time constraint: ${e}`);
     }
+
+    const updatedBalance = await connection.getTokenAccountBalance(
+      vaultSplTokenAccount.address
+    );
+    expect(updatedBalance.value.uiAmount).to.eql(
+      initialBalance.value.uiAmount,
+      "Vault balance should not have changed due to time constraint"
+    );
   });
 
   /** Helper functions */
@@ -234,6 +240,7 @@ export default function suite() {
 
     const vaultPDA = findVaultPDA(programInfo.vaultsCount);
     const vaultOwner = await generateFundedKeypair();
+
     const vaultSplTokenAccount = await getOrCreateAssociatedTokenAccount(
       connection,
       vaultOwner,
@@ -241,14 +248,14 @@ export default function suite() {
       vaultOwner.publicKey
     );
 
-    let adminVaultPDA: PublicKey, adminSplTokenAccount: Account;
+    let adminSplTokenAccount: Account;
     if (shouldSetupAdminVault) {
-      adminVaultPDA = getAdminVaultPDA();
       adminSplTokenAccount = await getOrCreateAssociatedTokenAccount(
         connection,
         admin,
         mint,
-        admin.publicKey
+        adminVaultPDA,
+        true
       );
     }
 
@@ -256,15 +263,11 @@ export default function suite() {
       vaultPDA,
       vaultOwner,
       vaultSplTokenAccount,
-      adminVaultPDA,
       adminSplTokenAccount,
     };
   }
 
   async function setupTestVault() {
-    const programInfo = await program.account.programInfo.fetch(programInfoPDA);
-
-    const testVaultPDA = findVaultPDA(programInfo.vaultsCount);
     const testVaultOwner = await generateFundedKeypair();
     const testVaultSplTokenAccount = await getOrCreateAssociatedTokenAccount(
       connection,
@@ -274,7 +277,6 @@ export default function suite() {
     );
 
     return {
-      testVaultPDA,
       testVaultOwner,
       testVaultSplTokenAccount,
     };
@@ -291,11 +293,11 @@ export default function suite() {
     return anchor.web3.PublicKey.findProgramAddressSync(
       [encode("admin-vault")],
       program.programId
-    )[0];
+    );
   }
 
   async function preFundAdminVault() {
-    const adminVaultFund = 1000000 * 10 ** 6; // pre fund 1 million tokens
+    const adminVaultFund = new BN(1000000 * 10 ** 6); // pre fund 1 million tokens
 
     const tempAdminKey = await generateFundedKeypair();
     const tempAdminSplTokenAccount = await getOrCreateAssociatedTokenAccount(
@@ -304,31 +306,37 @@ export default function suite() {
       mint,
       tempAdminKey.publicKey
     );
-    await mintToChecked(
-      connection,
-      tempAdminKey,
-      mint,
-      tempAdminSplTokenAccount.address,
-      admin,
-      adminVaultFund,
-      tokenDecimals
-    );
+    await mintTokens(adminVaultFund, tempAdminSplTokenAccount.address);
 
     let balance = await connection.getTokenAccountBalance(
       adminSplTokenAccount.address
     );
 
-    await program.methods
-      .depositSplTokens(new BN(adminVaultFund))
-      .accounts({
-        vault: adminVaultPDA,
-        payer: tempAdminKey.publicKey,
-        userSplTokenAccount: tempAdminSplTokenAccount.address,
-        vaultSplTokenAccount: adminSplTokenAccount.address,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([tempAdminKey])
-      .rpc();
+    console.log(
+      "admin spl token account: ",
+      adminSplTokenAccount.address.toBase58(),
+      " balance: ",
+      balance.value.uiAmount
+    );
+
+    //  can have a separate rpc call to deposit tokens to admin vault
+    try {
+      await program.methods
+        .depositSplTokens(new BN(adminVaultFund))
+        .accounts({
+          userVault: adminVaultPDA,
+          userSplTokenAccount: tempAdminSplTokenAccount.address,
+          destinationVaultSplTokenAccount: adminSplTokenAccount.address,
+          feePayer: tempAdminKey.publicKey,
+          mint: mint,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([tempAdminKey])
+        .rpc();
+    } catch (e: any) {
+      console.log("Here is the error: ");
+      console.log(e);
+    }
 
     console.log(
       `Funded ${adminVaultFund}, balance ${
@@ -372,30 +380,35 @@ export default function suite() {
     return vaultPDA;
   }
 
-  async function fundAccount(
-    signer: Keypair,
-    admin: Keypair,
-    tokenAccountAddress: PublicKey,
-    mint: PublicKey,
-    amount: number
-  ) {
+  async function mintTokens(amount: BN, destinationSplTokenAddress: PublicKey) {
+    try {
+      await program.methods
+        .mintTokensTo(amount)
+        .accounts({
+          mint: mint,
+          destinationVaultSplTokenAccount: destinationSplTokenAddress,
+          adminVault: adminVaultPDA,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          feePayer: admin.publicKey,
+        })
+        .signers([admin])
+        .rpc();
+    } catch (e: any) {
+      console.log("Mint tokens error: ");
+      console.log(e);
+    }
+  }
+
+  async function fundAccount(tokenAccountAddress: PublicKey, amount: number) {
     // Mint to the user's token account
-    await mintToChecked(
-      connection,
-      signer,
-      mint,
-      tokenAccountAddress,
-      admin,
-      amount,
-      tokenDecimals
-    );
+    await mintTokens(new BN(amount), tokenAccountAddress);
 
     let balance = await connection.getTokenAccountBalance(tokenAccountAddress);
 
     console.log(
-        `Funded ${amount}, balance ${
-            balance.value.uiAmount
-        } tokens to ${tokenAccountAddress.toBase58()}`
+      `Funded ${amount}, balance ${
+        balance.value.uiAmount
+      } tokens to ${tokenAccountAddress.toBase58()}`
     );
   }
 
@@ -406,23 +419,42 @@ export default function suite() {
     amountToDeposit: BN
   ) {
     await fundAccount(
-      testVaultOwner,
-      admin,
       fromTokenAddress,
-      mint,
       1000 * 10 ** 6
     );
 
     await program.methods
       .depositSplTokens(amountToDeposit)
       .accounts({
-        vault: vaultPDA,
-        payer: payer.publicKey,
+        userVault: vaultPDA,
+        feePayer: payer.publicKey,
         userSplTokenAccount: fromTokenAddress,
-        vaultSplTokenAccount: vaultTokenAddress,
+        destinationVaultSplTokenAccount: vaultTokenAddress,
+        mint: mint,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([payer])
+      .rpc();
+  }
+
+  async function withdrawSPLTokens(
+    toTokenAddress: PublicKey,
+    vaultTokenAddress: PublicKey,
+    feePayer: Keypair,
+    vaultOwner: Keypair,
+    amountToWithdraw: BN
+  ) {
+    await program.methods
+      .withdrawSplTokens(amountToWithdraw)
+      .accounts({
+        vault: vaultPDA,
+        owner: vaultOwner.publicKey,
+        payer: feePayer.publicKey,
+        userSplTokenAccount: toTokenAddress,
+        vaultSplTokenAccount: vaultTokenAddress,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([feePayer, vaultOwner])
       .rpc();
   }
 
@@ -430,12 +462,19 @@ export default function suite() {
     destinationVault: PublicKey,
     destinationVaultSplTokenAccount: PublicKey
   ) {
+    const [adminVaultPDA, _bump] = getAdminVaultPDA();
+
+    let destinationVaultSplTokenBalance =
+      await connection.getTokenAccountBalance(destinationVaultSplTokenAccount);
+    console.log(
+      `Destination vault balance before distribution: ${destinationVaultSplTokenBalance.value.uiAmount}`
+    );
+
     // Distribute tokens to all vaults
     await program.methods
       .distributeInterest()
       .accounts({
         adminVault: adminVaultPDA,
-        payer: admin.publicKey,
         destinationVault: destinationVault,
         adminVaultSplTokenAccount: adminSplTokenAccount.address,
         destinationVaultSplTokenAccount: destinationVaultSplTokenAccount,
@@ -443,29 +482,31 @@ export default function suite() {
         programInfo: programInfoPDA,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
-      .signers([admin])
       .rpc();
 
-    const vault = await program.account.vault.fetch(destinationVault);
-    console.log(
-        `Distributed ${vault.totalBalance.toNumber()} tokens to ${destinationVault.toBase58()}`
-    );
-
-    const vaultSplTokenAccountBalance = await connection.getTokenAccountBalance(
+    destinationVaultSplTokenBalance = await connection.getTokenAccountBalance(
       destinationVaultSplTokenAccount
     );
-
     console.log(
-        `Balance of ${destinationVaultSplTokenAccount.toBase58()} is ${
-            vaultSplTokenAccountBalance.value.uiAmount
-        }`
+      `Destination vault balance after distribution: ${destinationVaultSplTokenBalance.value.uiAmount}`
     );
-
-    return vaultSplTokenAccountBalance;
   }
 
   async function mintToken(admin: Keypair, decimals = tokenDecimals) {
     console.log("minting token");
-    return await createMint(connection, admin, admin.publicKey, null, decimals);
+
+    let mindAddress = await createMint(
+      connection,
+      admin,
+      adminVaultPDA,
+      null,
+      decimals
+    );
+
+    const mint = await getMint(connection, mindAddress);
+
+    console.log("mint authority: ", mint.mintAuthority, "mint Address: ", mindAddress.toBase58());
+
+    return mindAddress;
   }
 }

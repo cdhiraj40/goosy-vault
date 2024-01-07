@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 #[account]
 #[derive(Default, Debug)]
 pub struct ProgramInfo {
-    pub admin: Pubkey, // 32
+    pub admin: Pubkey,     // 32
     pub bump: u8,          // 1
     pub vaults_count: u32, // 8
 }

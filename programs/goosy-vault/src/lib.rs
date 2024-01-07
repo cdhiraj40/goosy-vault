@@ -37,4 +37,8 @@ pub(crate) mod goosy_vault {
     pub fn distribute_interest(ctx: Context<DistributeInterest>) -> Result<()> {
         instructions::distribute_interest(ctx)
     }
+
+    pub fn mint_tokens_to(ctx: Context<MintTokensTo>, amount: u64) -> Result<()> {
+        instructions::mint_tokens_to(ctx, amount)
+    }
 }
